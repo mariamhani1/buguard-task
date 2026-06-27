@@ -2,6 +2,8 @@ from pydantic import BaseModel, Field
 from typing import List, Dict, Any, Optional
 from models import AssetStatus
 
+
+
 class AssetImport(BaseModel):
     id: str
     type: str
@@ -15,3 +17,6 @@ class AssetImport(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     prompt: str
+
+class AnalyzeResponse(BaseModel):
+    result: str
