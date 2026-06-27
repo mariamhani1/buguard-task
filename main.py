@@ -4,6 +4,8 @@ from typing import List, Dict, Any
 import os
 from models import Base
 from crud import bulk_upsert_assets
+from schemas import AnalyzeRequest, AnalyzeResponse 
+from agent import get_analysis_agent
 
 # Database Setup
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:securepassword123@db:5432/darkatlas_asm")
@@ -36,7 +38,18 @@ async def import_assets(
         "errors": errors
     }
 
-# Placeholder for the Analyze endpoint (we will build this in agent.py next)
-@app.post("/api/v1/analyze")
-async def analyze_data(prompt: dict):
-    return {"message": "LangChain Agent endpoint coming next."}
+@app.post("/api/v1/analyze", response_model=AnalyzeResponse, tags=["AI Analysis Engine"])
+async def analyze_attack_surface(
+    request: AnalyzeRequest,
+    db: AsyncSession = Depends(get_db),
+    x_org_id: str = Header(default="default_org", alias="X-Organization-ID")
+):
+    """
+    Unified AI endpoint. Handles natural language queries, scoring, enrichment, and reporting via LangChain.
+    """
+    try:
+        agent_executor = get_analysis_agent(db, x_org_id)
+        response = await agent_executor.ainvoke({"input": request.prompt})
+        return AnalyzeResponse(result=response["output"])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI Agent error: {str(e)}")
