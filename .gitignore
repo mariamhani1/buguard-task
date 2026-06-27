@@ -1,0 +1,13 @@
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Docker
+postgres_data/
