@@ -1,0 +1,4 @@
+[
+  { "id": "g-d1", "type": "domain", "value": "globex.com", "status": "active", "source": "scan", "tags": ["root"], "metadata": {} },
+  { "id": "g-s1", "type": "subdomain", "value": "app.globex.com", "status": "active", "source": "scan", "tags": ["prod"], "metadata": {}, "parent": "g-d1" }
+]

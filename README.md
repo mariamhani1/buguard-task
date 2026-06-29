@@ -1,121 +1,187 @@
-# Buguard DarkAtlas - Asset Management API
+# Buguard DarkAtlas — Asset Management (Track B: AI Applications)
 
-This repository is my submission for the Buguard DarkAtlas Attack Surface Monitoring Internship Task, Track B: AI Applications. It is a self-contained Asset Management API built with Python, FastAPI, PostgreSQL, and LangChain.
+A self-contained slice of the DarkAtlas Attack Surface Monitoring platform: a minimal
+**FastAPI + PostgreSQL** asset inventory with a **LangChain** analysis layer that is
+grounded in the stored data. Built for Track B (AI Applications).
 
-## Overview & Features
+## What it does
 
-The service provides a focused backend for attack surface monitoring, with a single AI analysis endpoint that can interrogate inventory data, score risk, enrich assets, and generate reports from grounded database context.
+A single agentic `/analyze` endpoint (a LangChain tool-calling agent) exposes the four
+mandatory capabilities, each backed by a grounded tool over the database:
 
-The implementation covers all four mandatory LangChain capabilities required by the rubric:
+| Capability | Tool | How it stays grounded |
+|---|---|---|
+| 1. Natural-language asset query | `search_assets` | Translates English into structured SQL filters: type, status, **tags**, **value substring**, and **certificate expiry** (expired / expiring-within-N-days). Returns only real rows. |
+| 2. Risk scoring & summarization | `score_asset_risk` | Deterministic signals (expired/expiring certs, sensitive ports, EOL tech) are computed in **Python** (`lifecycle.py`); the LLM only summarizes them into a structured `RiskAssessment`. |
+| 3. Enrichment & categorization | `enrich_asset` | Looks the asset up in the DB, classifies environment/category/criticality as a structured `Enrichment`, and **persists** it back into the asset's metadata. |
+| 4. NL report generation | `generate_inventory_report` | Fed a deterministically-computed risk context; instructed to narrate only what is present. |
+| (support) relationship graph | `get_asset_graph` | Fetches an asset together with its related assets. |
 
-* Natural-language querying of the asset inventory.
-* Risk scoring and summarization for a specific asset.
-* Automated enrichment to infer environment and criticality.
-* Natural-language report generation for the overall organization.
+**Grounding is enforced three ways:** tools only ever return real DB rows; risk facts
+are computed in code (not guessed by the model); a strict system prompt forbids
+inventing assets, and tools return explicit "not found" instead of fabricating.
 
-It also includes the two bonus stretch goals:
+## Architecture
 
-* Agentic tool-use, implemented with a LangChain ReAct-style tool-calling agent that selects the appropriate capability dynamically from user intent.
-* Multi-tenant isolation, enforced through the `X-Organization-ID` header so each organization only sees its own data.
+```
+main.py        FastAPI app: import, list, graph, analyze endpoints; lifespan; error mapping
+auth.py        API-key auth (org resolved from key) + per-org rate limiting
+config.py      env-driven settings (no hard-coded secrets)
+models.py      SQLAlchemy models: Asset (typed enums, JSONB, ARRAY), AssetRelationship
+schemas.py     Pydantic: AssetImport (per-row validation) + structured tool outputs
+crud.py        idempotent bulk upsert; pure merge_metadata / merge_tags helpers
+services.py    grounded, org-scoped data access (query/get/enrich/graph/report context)
+lifecycle.py   deterministic date + risk-signal computation
+agent.py       LangChain tools + tool-calling agent
+seed/          sample dataset (two tenants); seed.py loads it through the API
+tests/         pure unit tests + Postgres-gated integration tests
+```
 
-Additional implementation protections include idempotent ingestion, deduplication, and strict anti-hallucination guardrails so the model only responds from retrieved database context.
+## Setup & run
 
-## Setup & Run Instructions
+1. Create your env file and add your OpenAI key:
 
-1. Clone the repository and enter the project directory.
+   ```bash
+   cp .env.example .env
+   # edit .env: set OPENAI_API_KEY and a strong POSTGRES_PASSWORD
+   ```
+
+2. Start the API + PostgreSQL:
+
+   ```bash
+   docker compose up --build -d
+   ```
+
+   API: `http://localhost:8000` · Swagger UI: `http://localhost:8000/docs`
+
+3. Seed the sample dataset (two tenants) through the import endpoint:
+
+   ```bash
+   pip install httpx          # only if running seed.py on the host
+   python seed.py             # or: docker compose exec web python seed.py
+   ```
+
+### Environment variables
+
+| Var | Purpose | Default |
+|---|---|---|
+| `DATABASE_URL` | Async Postgres URL | derived from `POSTGRES_*` in compose |
+| `POSTGRES_USER/PASSWORD/DB` | DB provisioning | `postgres` / `postgres` / `darkatlas_asm` |
+| `OPENAI_API_KEY` | LLM provider key (read from env, never committed) | — |
+| `LLM_MODEL` | Chat model | `gpt-4o-mini` |
+| `API_KEYS` | `key:org` pairs; org is resolved from the key | DEV keys (see below) |
+| `ANALYZE_RATE_LIMIT_PER_MIN` | per-org `/analyze` budget | `30` |
+| `EXPIRING_SOON_DAYS` | "expiring soon" window | `30` |
+| `MAX_IMPORT_BATCH` | max records per import | `5000` |
+
+## Authentication & multi-tenancy
+
+Every endpoint requires an `X-API-Key` header. The **organization is resolved from the
+key server-side** — clients never assert their own tenant, so one org's data cannot leak
+into another's view. Default DEV keys (override via `API_KEYS` in production):
+
+- `dev-key-acme` → `org_acme`
+- `dev-key-globex` → `org_globex`
+
+## API
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/api/v1/assets/import` | Bulk import; per-row validation; idempotent. `200` ok / `207` partial / `422` all-failed |
+| `GET` | `/api/v1/assets` | Filter by `type`, `status`, `tag` (repeatable), `value_contains`; `limit`/`offset` pagination |
+| `GET` | `/api/v1/assets/{value}/graph` | Asset + its related assets |
+| `POST` | `/api/v1/analyze` | Grounded LangChain agent (NL query / risk / enrich / report); rate-limited |
+| `GET` | `/health` | Liveness |
 
 ```bash
-git clone <your-repo-url>
-cd buguard-task
+# Import
+curl -X POST localhost:8000/api/v1/assets/import \
+  -H 'X-API-Key: dev-key-acme' -H 'Content-Type: application/json' \
+  -d @seed/assets.json
+
+# List production subdomains
+curl 'localhost:8000/api/v1/assets?type=subdomain&tag=production' -H 'X-API-Key: dev-key-acme'
+
+# Analyze
+curl -X POST localhost:8000/api/v1/analyze \
+  -H 'X-API-Key: dev-key-acme' -H 'Content-Type: application/json' \
+  -d '{"prompt":"Show me all expired certificates on production subdomains."}'
 ```
 
-2. Create a `.env` file in the project root based on `.env.example`.
+## Example prompts & outputs
 
-```env
-OPENAI_API_KEY=your_active_api_key_here
-DATABASE_URL=postgresql+asyncpg://postgres:securepassword123@db:5432/darkatlas_asm
-```
+> Outputs are LLM-generated and will vary in wording; the **facts** are grounded in the
+> seed dataset (`seed/assets.json`). Assumes a run date in mid-2026 (so `cert1`
+> @ 2025-01-02 is expired and `cert2` @ 2026-07-15 is expiring soon).
 
-Never commit real secrets, API keys, or production database credentials to the repository.
+**Prompt:** `"Show me all expired certificates."`
+**Behind the scenes:** `search_assets(asset_type="certificate", cert_expired=true)` →
+returns only `CN=api.example.com`.
+**Output:** `"One expired certificate was found: CN=api.example.com (issuer Let's Encrypt,
+expired 2025-01-02), which covers api.example.com."`
 
-3. Launch the application and PostgreSQL together with Docker Compose.
+**Prompt:** `"What's the risk of the service 3389/tcp?"`
+**Behind the scenes:** `score_asset_risk("3389/tcp")` with signal `sensitive_service=true`.
+**Output (structured `RiskAssessment`):** `{"risk_score": 80, "summary": "Exposed RDP
+(3389/tcp) on a production host — high-value target for brute-force and lateral movement.",
+"factors": ["sensitive port 3389 (RDP)", "production tag"]}`
+
+**Prompt:** `"Classify and enrich api.example.com."`
+**Output:** persisted enrichment `{"environment":"prod","category":"api","criticality":"high"}`
+written into the asset's metadata (visible afterward via `GET /api/v1/assets`).
+
+**Prompt:** `"Does foo.invalid.example exist?"` (asset not in inventory)
+**Output:** `"I cannot find foo.invalid.example in the database."` (no fabrication.)
+
+## Design decisions & assumptions
+
+- **Async stack.** SQLAlchemy async engine + `asyncpg` so DB calls don't block the event loop.
+- **Conflict merge strategy.** Re-importing an asset merges, it doesn't clobber: metadata
+  is a key-wise merge (newer source wins per key, older keys retained) and tags are a
+  de-duplicated **union** (`crud.merge_metadata` / `merge_tags`, unit-tested). `first_seen`
+  is set once; `last_seen` updates on every re-sighting.
+- **Idempotency.** Asset upsert keys on the composite PK `(id, org_id)`. Relationship edges
+  use a **deterministic `uuid5`** of `(org, source, target, type)` plus a unique constraint,
+  so re-imports never create duplicate edges (the previous random-UUID approach did).
+- **Re-appearing assets** revive: a stale asset seen again returns to `active`.
+- **Malformed records** are validated per row (`AssetImport`); a bad record is reported in
+  `errors` and counted as failed without aborting the batch.
+- **Lifecycle dates in code, not the model.** Expired / expiring-soon and EOL-tech are
+  computed deterministically (`lifecycle.py`); the LLM only narrates them.
+- **Structured output.** Risk and enrichment use `llm.with_structured_output(...)` against
+  Pydantic schemas, so those tool results are validated, not free-text.
+- **Security.** Keys never logged; agent `verbose` is off by default; both write and paid
+  endpoints require auth; per-org rate limiting on `/analyze`; batch-size cap; `.dockerignore`
+  keeps local `.env` out of the image; secrets are env-driven with placeholders in `.env.example`.
+- **Schema management.** `create_all` runs on startup for demo convenience; **Alembic
+  migrations** are the intended production path.
+
+## Edge cases handled
+
+Idempotent imports · conflicting two-source data (merge) · stale→active revival ·
+malformed/partial records (graceful, per-row) · large lists (pagination + capped query/report
+with an explicit "showing N of M" note) · certificate expired vs expiring-soon · ambiguous /
+out-of-scope queries (agent returns "not found"/asks to clarify, never invents) · multi-tenant
+isolation (org from API key).
+
+## Tests
 
 ```bash
-docker-compose up --build -d
+# Pure unit tests (no DB or API key needed): merge/dedup, lifecycle dates, validation, auth
+pytest tests/test_merge.py tests/test_lifecycle.py tests/test_schemas.py tests/test_auth.py
+
+# Full suite incl. DB integration (dedup, merge, idempotent relationships, isolation, filtering)
+docker compose exec web pytest
+# or locally with a reachable Postgres:
+TEST_DATABASE_URL=postgresql+asyncpg://postgres:postgres@localhost:5432/darkatlas_asm pytest
 ```
 
-The API will be available at `http://localhost:8000`, and the PostgreSQL container will be started at the same time through the `db` service.
+The integration tests skip cleanly if no PostgreSQL is reachable, so the pure suite always runs.
 
-## API Documentation & Testing
+## What I'd do next
 
-The auto-generated Swagger UI is available at:
-
-`http://localhost:8000/docs`
-
-To run the test suite inside the application container, use:
-
-```bash
-docker-compose exec web pytest
-```
-
-If no tests are present yet, this command should be used once a `pytest` suite is added to the project.
-
-## Example Prompts & Outputs
-
-### 1) Active Domains Query
-
-**Endpoint:** `POST /api/v1/analyze`
-
-**Request**
-
-```json
-{
-   "prompt": "Show me all active domains in our inventory."
-}
-```
-
-**Response**
-
-```json
-{
-   "result": "Active domains currently found in the database:\n\n1. example.com (ID: a1, Status: active)\n2. api.example.net (ID: a2, Status: active)\n\nI can also summarize the risk posture for any of these assets if needed."
-}
-```
-
-### 2) Certificate Risk Scoring
-
-**Endpoint:** `POST /api/v1/analyze`
-
-**Request**
-
-```json
-{
-   "prompt": "Generate a risk score for the certificate attached to portal.example.com that expires in 5 days."
-}
-```
-
-**Response**
-
-```json
-{
-   "result": "Risk score: 92/100.\n\nSummary: The certificate is close to expiration and presents a high likelihood of service disruption if not renewed promptly. Assets depending on this endpoint should be reviewed for failover or renewal readiness."
-}
-```
-
-## Design Decisions & Assumptions
-
-* `asyncpg` is used through SQLAlchemy’s async engine so database calls do not block the FastAPI event loop. This keeps the API responsive during ingestion and AI analysis workloads.
-* `metadata` is stored as a PostgreSQL `JSONB` column so the system can accept dynamic scan payloads without forcing a rigid relational schema for every enrichment source.
-* Bulk imports are idempotent by design. The import pipeline uses PostgreSQL `ON CONFLICT` UPSERT statements to deduplicate records by `(id, org_id)` and safely update existing rows instead of inserting duplicates.
-* When duplicate records arrive, the newest scan is treated as the source of truth. The import flow refreshes `last_seen`, updates the asset back to `active`, and replaces stored metadata with the latest payload.
-* Re-appearing assets are intentionally cycled back to `active` during import so stale inventory can be revived automatically when the same asset is observed again.
-* Malformed records are isolated inside `try/except` blocks during bulk import. A bad row is counted as a failure, but it does not abort the entire batch, which allows partial success and better operational resilience.
-* The LangChain agent is protected by a strict system prompt that forces grounding in tool output only. It is instructed not to hallucinate domains, IP addresses, or other assets that are not present in the database.
-* The AI layer is intentionally constrained to the known inventory context rather than unconstrained free-form generation. If the database does not contain the answer, the assistant should explicitly say so.
-
-## Repository Notes
-
-* FastAPI serves the API layer and automatically exposes the OpenAPI schema and Swagger UI.
-* PostgreSQL stores the asset inventory, relationships, and tenant-scoped records.
-* LangChain orchestrates the four analysis capabilities through a tool-calling agent.
-* Docker Compose brings up both the web application and the database in one command for reproducible local setup.
+- Alembic migrations instead of `create_all`; richer relationship typing in the import schema
+  (explicit `service→ip`, `technology→service`).
+- Output-quality eval harness + LLM response caching (bonus).
+- Roles/scopes on top of API keys; shared-store rate limiting for multi-instance deploys.
+- A small graph visualization of the relationships endpoint.

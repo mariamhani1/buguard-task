@@ -1,103 +1,165 @@
+"""LangChain analysis layer.
+
+Five grounded tools wrap the service layer (each opening its own short-lived DB
+session) and expose the four mandatory capabilities:
+  * search_assets            -> natural-language asset query (rich, structured filters)
+  * score_asset_risk         -> risk scoring & summarization (structured output)
+  * enrich_asset             -> enrichment & categorization (persisted, structured output)
+  * generate_inventory_report-> natural-language report generation (grounded context)
+  * get_asset_graph          -> relationship graph traversal (supports the others)
+
+Grounding is enforced three ways: tools only ever return real DB rows, deterministic
+risk facts are computed in Python (lifecycle), and a strict system prompt forbids the
+model from inventing assets."""
 import json
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
-from langchain.agents import tool, AgentExecutor, create_tool_calling_agent
+import logging
+from typing import List, Optional
+
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
-from models import Asset
-from tabulate import tabulate
 
-def get_analysis_agent(db: AsyncSession, org_id: str):
-    # Initialize the LLM (ensure OPENAI_API_KEY is in your .env)
-    llm = ChatOpenAI(temperature=0, model="gpt-4o-mini")
+import config
+import lifecycle
+import services
+from schemas import RiskAssessment, Enrichment
 
-    # --- TOOL 1: Natural Language Query ---
+logger = logging.getLogger("darkatlas")
+
+_llm: Optional[ChatOpenAI] = None
+
+
+def get_llm() -> ChatOpenAI:
+    """Build the chat model once and reuse it across requests."""
+    global _llm
+    if _llm is None:
+        if not config.OPENAI_API_KEY:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        _llm = ChatOpenAI(model=config.LLM_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
+    return _llm
+
+
+SYSTEM_PROMPT = (
+    "You are the Buguard DarkAtlas attack-surface analysis assistant. "
+    "Answer ONLY using data returned by your tools. "
+    "NEVER invent assets, domains, IPs, certificates, ports, or dates that are not present in tool output. "
+    "If a tool returns 'not found' or no results, say so plainly and do not fabricate. "
+    "When a question is ambiguous or outside the asset inventory, ask for clarification or state it is out of scope. "
+    "Prefer concise, factual answers grounded in the retrieved rows."
+)
+
+
+def get_analysis_agent(session_factory, org_id: str) -> AgentExecutor:
+    """Construct an org-scoped tool-calling agent. `session_factory` is the async
+    sessionmaker; each tool opens its own session so no session is shared across the
+    agent run."""
+    llm = get_llm()
+
     @tool
-    async def query_assets_tool(asset_type: str = None, status: str = None) -> str:
-        """Use this to find specific assets. You can filter by asset_type (e.g., domain, certificate) or status (e.g., active, stale)."""
-        query = select(Asset).where(Asset.org_id == org_id)
-        if asset_type:
-            query = query.where(Asset.type == asset_type)
-        if status:
-            query = query.where(Asset.status == status)
-            
-        result = await db.execute(query.limit(50)) # Sane limits to protect context window
-        assets = result.scalars().all()
-        
-        if not assets:
+    async def search_assets(
+        asset_type: Optional[str] = None,
+        status: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        value_contains: Optional[str] = None,
+        cert_expired: Optional[bool] = None,
+        expiring_within_days: Optional[int] = None,
+    ) -> str:
+        """Find assets in the inventory. Filters (all optional, combinable):
+        asset_type (domain/subdomain/ip_address/service/certificate/technology),
+        status (active/stale/archived), tags (match any, e.g. ['prod','production']),
+        value_contains (substring of the asset value), cert_expired (true=only expired
+        certificates), expiring_within_days (certificates expiring within N days)."""
+        async with session_factory() as db:
+            items, total = await services.list_assets(
+                db, org_id,
+                type=asset_type, status=status, tags=tags, value_contains=value_contains,
+                cert_expired=cert_expired, expiring_within_days=expiring_within_days,
+            )
+        if not items:
             return "No assets found matching that criteria."
-            
-        data = [{"id": a.id, "value": a.value, "type": a.type, "status": a.status.value} for a in assets]
-        return json.dumps(data)
+        note = f"\n(Showing {len(items)} of {total} matches.)" if total > len(items) else ""
+        return json.dumps(items, default=str) + note
 
-    # --- TOOL 2: Risk Scoring & Summarization ---
     @tool
-    async def calculate_risk_tool(asset_value: str) -> str:
-        """Use this to calculate a risk score and summarize vulnerabilities for a specific asset by its value (e.g., example.com)."""
-        query = select(Asset).where(and_(Asset.org_id == org_id, Asset.value == asset_value))
-        result = await db.execute(query)
-        asset = result.scalars().first()
-        
+    async def score_asset_risk(asset_value: str) -> str:
+        """Compute a risk score (0-100) and concise summary for a single asset,
+        identified by its exact value (e.g. 'api.example.com' or '3389/tcp')."""
+        async with session_factory() as db:
+            asset = await services.get_asset_by_value(db, org_id, asset_value)
         if not asset:
-            return f"Asset {asset_value} not found in the database."
-            
-        # Have the LLM analyze the metadata internally
+            return f"Asset '{asset_value}' not found in the database."
+        signals = lifecycle.asset_risk_signals(asset, config.EXPIRING_SOON_DAYS)
         prompt = ChatPromptTemplate.from_template(
-            "Analyze this asset for security risks (e.g., expired certs, exposed ports). "
-            "Return a strict JSON with a numerical 'risk_score' (0-100) and a short 'summary'.\n\nAsset Data: {data}"
+            "Assess the security risk of this asset using ONLY the provided data and the "
+            "precomputed deterministic signals. Today is {today}.\n"
+            "Asset: {asset}\nSignals: {signals}"
         )
-        chain = prompt | llm
-        res = await chain.ainvoke({"data": json.dumps(asset.metadata_)})
-        return res.content
+        chain = prompt | llm.with_structured_output(RiskAssessment)
+        result: RiskAssessment = await chain.ainvoke({
+            "today": lifecycle.now_utc().date().isoformat(),
+            "asset": json.dumps(asset, default=str),
+            "signals": json.dumps(signals, default=str),
+        })
+        return result.model_dump_json()
 
-    # --- TOOL 3: Automated Enrichment ---
     @tool
-    def enrich_asset_tool(asset_value: str, raw_tags: list[str]) -> str:
-        """Use this to classify the environment (prod/staging/dev) and criticality of an asset based on its value and tags."""
-        prompt = ChatPromptTemplate.from_template(
-            "Given the asset '{value}' and tags '{tags}', classify its environment (prod, staging, dev) "
-            "and criticality (low, medium, high). Return ONLY a JSON object with these two keys."
-        )
-        chain = prompt | llm
-        res = chain.invoke({"value": asset_value, "tags": raw_tags})
-        return res.content
+    async def enrich_asset(asset_value: str) -> str:
+        """Classify and enrich a single existing asset (environment, category,
+        criticality) and PERSIST the result into its metadata. Identify it by value."""
+        async with session_factory() as db:
+            asset = await services.get_asset_by_value(db, org_id, asset_value)
+            if not asset:
+                return f"Asset '{asset_value}' not found; cannot enrich a non-existent asset."
+            prompt = ChatPromptTemplate.from_template(
+                "Classify this asset's environment (prod/staging/dev/unknown), functional "
+                "category, and criticality using ONLY its data.\nAsset: {asset}"
+            )
+            chain = prompt | llm.with_structured_output(Enrichment)
+            enrichment: Enrichment = await chain.ainvoke({"asset": json.dumps(asset, default=str)})
+            updated = await services.apply_enrichment(db, org_id, asset_value, enrichment.model_dump())
+        return json.dumps({"persisted": True, "asset": updated}, default=str)
 
-    # --- TOOL 4: Natural Language Report Generation ---
     @tool
-    async def generate_report_tool() -> str:
-        """Use this to generate a comprehensive markdown-formatted inventory and risk report for the entire organization."""
-        query = select(Asset).where(Asset.org_id == org_id)
-        result = await db.execute(query)
-        assets = result.scalars().all()
-        
-        if not assets:
-            return "Cannot generate report: No assets exist in the database."
-            
-        rows = [[a.type, a.value, a.status.value] for a in assets]
-        table_md = tabulate(rows, headers=["Type", "Value", "Status"], tablefmt="github")
-        
+    async def generate_inventory_report() -> str:
+        """Generate a readable inventory and risk report for the whole organization,
+        grounded in a deterministically-computed risk context."""
+        async with session_factory() as db:
+            context = await services.build_report_context(db, org_id, config.EXPIRING_SOON_DAYS)
+        if not context["assets"]:
+            return "Cannot generate report: no assets exist for this organization."
         prompt = ChatPromptTemplate.from_template(
-            "You are a CISO. Write a brief executive summary based on this asset inventory table:\n\n{table}"
+            "You are a CISO writing a brief inventory & risk report. Use ONLY this grounded "
+            "context (counts, expired/expiring certificates, sensitive exposed services, "
+            "end-of-life technologies). Do not invent any asset, host, or finding not present "
+            "in the context.\n\nContext (JSON):\n{context}"
         )
         chain = prompt | llm
-        res = await chain.ainvoke({"table": table_md})
-        return res.content
+        result = await chain.ainvoke({"context": json.dumps(context, default=str)})
+        return result.content
 
-    tools = [query_assets_tool, calculate_risk_tool, enrich_asset_tool, generate_report_tool]
-    
-    # Grounding Guardrail
-    system_prompt = (
-        "You are the Buguard DarkAtlas AI Assistant. "
-        "Strict Rule: Answer questions based ONLY on data retrieved from your tools. "
-        "NEVER hallucinate assets, domains, or IP addresses that do not exist in the database. "
-        "If you do not know the answer, say 'I cannot find this information in the database.'"
-    )
-    
+    @tool
+    async def get_asset_graph(asset_value: str) -> str:
+        """Return an asset together with its related assets (subdomain->domain,
+        service->ip, certificate->subdomain, etc.). Identify it by value."""
+        async with session_factory() as db:
+            graph = await services.get_neighbors(db, org_id, asset_value)
+        if not graph:
+            return f"Asset '{asset_value}' not found in the database."
+        return json.dumps(graph, default=str)
+
+    tools = [search_assets, score_asset_risk, enrich_asset, generate_inventory_report, get_asset_graph]
+
     prompt = ChatPromptTemplate.from_messages([
-        ("system", system_prompt),
+        ("system", SYSTEM_PROMPT),
         ("human", "{input}"),
         ("placeholder", "{agent_scratchpad}"),
     ])
-    
     agent = create_tool_calling_agent(llm, tools, prompt)
-    return AgentExecutor(agent=agent, tools=tools, verbose=True)
+    return AgentExecutor(
+        agent=agent,
+        tools=tools,
+        verbose=config.AGENT_VERBOSE,
+        handle_parsing_errors=True,
+        max_iterations=config.AGENT_MAX_ITERATIONS,
+    )

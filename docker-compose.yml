@@ -4,15 +4,15 @@ services:
     container_name: darkatlas_db
     restart: always
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: securepassword123
-      POSTGRES_DB: darkatlas_asm
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-darkatlas_asm}
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
       interval: 5s
       timeout: 5s
       retries: 5
@@ -24,8 +24,13 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql+asyncpg://postgres:securepassword123@db:5432/darkatlas_asm
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-darkatlas_asm}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - API_KEYS=${API_KEYS:-}
+      - AGENT_VERBOSE=${AGENT_VERBOSE:-false}
+      - ANALYZE_RATE_LIMIT_PER_MIN=${ANALYZE_RATE_LIMIT_PER_MIN:-30}
+      - EXPIRING_SOON_DAYS=${EXPIRING_SOON_DAYS:-30}
     depends_on:
       db:
         condition: service_healthy

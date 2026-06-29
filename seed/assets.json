@@ -1,0 +1,13 @@
+[
+  { "id": "d1", "type": "domain", "value": "example.com", "status": "active", "source": "scan", "tags": ["root"], "metadata": {} },
+  { "id": "s1", "type": "subdomain", "value": "api.example.com", "status": "active", "source": "scan", "tags": ["prod", "production"], "metadata": {}, "parent": "d1" },
+  { "id": "s2", "type": "subdomain", "value": "staging.example.com", "status": "active", "source": "scan", "tags": ["staging"], "metadata": {}, "parent": "d1" },
+  { "id": "s3", "type": "subdomain", "value": "legacy.example.com", "status": "stale", "source": "scan", "tags": ["prod"], "metadata": {}, "parent": "d1" },
+  { "id": "ip1", "type": "ip_address", "value": "203.0.113.10", "status": "active", "source": "scan", "tags": ["prod"], "metadata": {} },
+  { "id": "svc1", "type": "service", "value": "443/tcp", "status": "active", "source": "scan", "tags": ["prod"], "metadata": { "banner": "nginx", "port": 443 }, "parent": "ip1" },
+  { "id": "svc2", "type": "service", "value": "3389/tcp", "status": "active", "source": "scan", "tags": ["prod"], "metadata": { "banner": "Microsoft Terminal Services", "port": 3389 }, "parent": "ip1" },
+  { "id": "cert1", "type": "certificate", "value": "CN=api.example.com", "status": "active", "source": "scan", "tags": [], "metadata": { "issuer": "Let's Encrypt", "expires": "2025-01-02" }, "covers": "s1" },
+  { "id": "cert2", "type": "certificate", "value": "CN=staging.example.com", "status": "active", "source": "scan", "tags": ["staging"], "metadata": { "issuer": "Let's Encrypt", "expires": "2026-07-15" }, "covers": "s2" },
+  { "id": "tech1", "type": "technology", "value": "nginx", "status": "active", "source": "scan", "tags": ["prod"], "metadata": { "version": "1.18", "eol": false }, "parent": "s1" },
+  { "id": "tech2", "type": "technology", "value": "OpenSSL", "status": "active", "source": "scan", "tags": ["prod"], "metadata": { "version": "1.0.2", "eol": true }, "parent": "svc1" }
+]
